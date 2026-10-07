@@ -1,0 +1,32 @@
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+
+:root {
+  font-family: 'IBM Plex Sans', sans-serif;
+  --mono: 'IBM Plex Mono', 'SFMono-Regular', Consolas, monospace;
+  --bg: #111512;
+  --surface: #181e19;
+  --surface-2: #222a23;
+  --line: #303b32;
+  --text: #dce6dc;
+  --muted: #8a988d;
+  --lime: #c2f36a;
+  --red: #f27668;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; min-height: 100%; background: var(--bg); }
+body { min-width: 320px; min-height: 100vh; margin: 0; background-color: var(--bg); background-image: linear-gradient(rgba(118, 142, 116, .025) 1px, transparent 1px), linear-gradient(90deg, rgba(118, 142, 116, .025) 1px, transparent 1px); background-size: 38px 38px; }
+button, input, select { font: inherit; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--lime); outline-offset: 2px; }
+button:disabled { cursor: not-allowed; }
+::selection { color: #111812; background: var(--lime); }
+#root { min-height: 100vh; }

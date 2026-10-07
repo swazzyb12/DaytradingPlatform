@@ -1,0 +1,26 @@
+{
+  "name": "paper-trader-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "tsx --test src/domain.test.ts src/market.test.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.1.0",
+    "@fastify/websocket": "^11.3.3",
+    "decimal.js": "^10.4.3",
+    "fastify": "^5.12.5",
+    "sql.js": "^1.13.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/sql.js": "^1.4.9",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "~5.6.2"
+  }
+}

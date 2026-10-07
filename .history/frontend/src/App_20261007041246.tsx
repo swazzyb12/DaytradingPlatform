@@ -1,0 +1,267 @@
+import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from 'react'
+import {
+  Activity, ArrowDownRight, ArrowUpRight, CandlestickChart, ChevronDown, CircleHelp,
+  Clock3, Gauge, History, LayoutDashboard, LoaderCircle, RefreshCw, RotateCcw,
+  Settings2, ShieldCheck, SlidersHorizontal, Wifi, WifiOff, X,
+} from 'lucide-react'
+import './App.css'
+
+type Product = 'perpetual' | 'option'
+type Side = 'buy' | 'sell'
+type View = 'positions' | 'orders' | 'fills' | 'ledger'
+interface Level { price: string; size: string }
+interface Market {
+  contract: string; product: Product | 'delivery'; source: string; connected: boolean; updatedAt: number
+  last: string; mark: string; index: string; multiplier: string; priceStep: string; sizeStep: string
+  minSize: string; makerFeeRate: string; takerFeeRate: string; fundingRate: string | null
+  nextFundingAt: number | null; bids: Level[]; asks: Level[]
+  trades: Array<{ id: string; price: string; size: string; side: Side; time: number }>
+  options?: { underlying: string; strike: string; expiryAt: number; call: boolean; impliedVolatility: string | null; delta: string | null; gamma: string | null; vega: string | null; theta: string | null }
+}
+interface Instrument {
+  contract: string; product: Product; underlying?: string; strike?: string; expiryAt?: number; call?: boolean
+  mark?: string; priceStep?: string; sizeStep?: string; minSize?: string
+}
+interface Order { id: string; contract: string; product: Product; side: Side; kind: 'market' | 'limit'; quantity: string; remaining: string; limitPrice: string | null; status: string; createdAt: number }
+interface Position { contract: string; product: Product; quantity: string; entryPrice: string; multiplier: string; markPrice: string; updatedAt: number }
+interface Fill { id: string; contract: string; side: Side; quantity: string; price: string; fee: string; liquidity: string; createdAt: number; slippageBps: string }
+interface LedgerEntry { id: string; type: string; contract: string | null; amount: string; balance: string; description: string; createdAt: number }
+interface PaperState { balance: string; leverage: number; makerFeeRate: string; takerFeeRate: string; slippageBps: string; orders: Order[]; positions: Position[]; fills: Fill[]; ledger: LedgerEntry[] }
+interface Metrics { balance: string; unrealizedPnl: string; equity: string; usedMargin: string; availableMargin: string }
+
+const API = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
+const API_WS = API.replace(/^http/, 'ws')
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API}${path}`, { ...init, headers: { 'content-type': 'application/json', ...init?.headers } })
+  const body = await response.json() as T & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? `Request failed (${response.status})`)
+  return body
+}
+function money(value: string | number, digits = 2) {
+  const number = Number(value)
+  return Number.isFinite(number) ? new Intl.NumberFormat('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(number) : '--'
+}
+function shortTime(value: number) { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }
+function expiry(value?: number) { return value ? new Date(value).toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' }) : 'Perpetual' }
+
+function App() {
+  const [product, setProduct] = useState<Product>('perpetual')
+  const [instruments, setInstruments] = useState<Instrument[]>([])
+  const [market, setMarket] = useState<Market | null>(null)
+  const [paper, setPaper] = useState<PaperState | null>(null)
+  const [metrics, setMetrics] = useState<Metrics | null>(null)
+  const [selectedContract, setSelectedContract] = useState('BTC_USDT')
+  const [side, setSide] = useState<Side>('buy')
+  const [orderKind, setOrderKind] = useState<'market' | 'limit'>('market')
+  const [quantity, setQuantity] = useState('1')
+  const [limitPrice, setLimitPrice] = useState('')
+  const [activeView, setActiveView] = useState<View>('positions')
+  const [search, setSearch] = useState('')
+  const [message, setMessage] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [socketOnline, setSocketOnline] = useState(false)
+  const [clock, setClock] = useState(Date.now())
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const fresh = Boolean(market?.connected && clock - market.updatedAt < 15_000)
+  const visibleInstruments = useMemo(() => instruments.filter((item) => item.contract.toLowerCase().includes(search.trim().toLowerCase())).slice(0, 100), [instruments, search])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000)
+    void request<{ state: PaperState; metrics: Metrics }>('/api/paper/state').then((value) => { setPaper(value.state); setMetrics(value.metrics) }).catch((error: Error) => setMessage(error.message))
+    void request<{ market: Market | null }>('/api/market').then((value) => {
+      if (value.market) { setMarket(value.market); setSelectedContract(value.market.contract); setProduct(value.market.product === 'option' ? 'option' : 'perpetual') }
+    }).catch(() => undefined)
+    const socket = new WebSocket(`${API_WS}/api/ws`)
+    socket.addEventListener('open', () => setSocketOnline(true))
+    socket.addEventListener('close', () => setSocketOnline(false))
+    socket.addEventListener('error', () => setSocketOnline(false))
+    socket.addEventListener('message', (event) => {
+      try {
+        const update = JSON.parse(String(event.data)) as { type: string; market?: Market; state?: PaperState; metrics?: Metrics }
+        if (update.market) setMarket(update.market)
+        if (update.state) setPaper(update.state)
+        if (update.metrics) setMetrics(update.metrics)
+      } catch { setMessage('Received an unreadable market update.') }
+    })
+    return () => { window.clearInterval(timer); socket.close() }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    setSearch('')
+    void request<{ instruments: Instrument[] }>(`/api/instruments?product=${product}`).then((value) => {
+      if (!active) return
+      setInstruments(value.instruments)
+      if (value.instruments.length) {
+        const preferred = value.instruments.find((item) => item.contract === (product === 'perpetual' ? 'BTC_USDT' : selectedContract)) ?? value.instruments[0]
+        setSelectedContract(preferred.contract)
+        void selectInstrument(preferred.contract, product)
+      }
+    }).catch((error: Error) => { if (active) setMessage(error.message) })
+    return () => { active = false }
+  }, [product])
+
+  async function selectInstrument(contract: string, nextProduct = product) {
+    setSelectedContract(contract); setBusy(true)
+    try {
+      const value = await request<{ market: Market }>('/api/market/select', { method: 'POST', body: JSON.stringify({ contract, product: nextProduct }) })
+      if (value.market) setMarket(value.market)
+      setMessage('')
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Could not load this market.') }
+    finally { setBusy(false) }
+  }
+  async function submitOrder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); if (!market) return; setBusy(true)
+    try {
+      const value = await request<{ state: PaperState; metrics: Metrics }>('/api/paper/orders', { method: 'POST', body: JSON.stringify({ contract: selectedContract, product, side, kind: orderKind, quantity, ...(orderKind === 'limit' ? { limitPrice } : {}) }) })
+      setPaper(value.state); setMetrics(value.metrics); setMessage('Paper order accepted.')
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Order rejected.') }
+    finally { setBusy(false) }
+  }
+  async function cancelOrder(id: string) {
+    try { await request(`/api/paper/orders/${encodeURIComponent(id)}`, { method: 'DELETE' }); setMessage('Paper order cancelled.') }
+    catch (error) { setMessage(error instanceof Error ? error.message : 'Could not cancel order.') }
+  }
+  async function saveSettings(patch: Partial<Pick<PaperState, 'leverage' | 'makerFeeRate' | 'takerFeeRate' | 'slippageBps'>>) {
+    try {
+      const value = await request<{ state: PaperState; metrics: Metrics }>('/api/paper/settings', { method: 'PATCH', body: JSON.stringify(patch) })
+      setPaper(value.state); setMetrics(value.metrics); setMessage('Paper settings saved.')
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Could not save settings.') }
+  }
+  async function resetAccount() {
+    if (!window.confirm('Reset the practice account, positions, orders, fills and history?')) return
+    try {
+      const value = await request<{ state: PaperState; metrics: Metrics }>('/api/paper/reset', { method: 'POST', body: '{}' })
+      setPaper(value.state); setMetrics(value.metrics); setMessage('Practice account reset.')
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Could not reset account.') }
+  }
+  async function closePosition(position: Position) {
+    const closeSide = Number(position.quantity) > 0 ? 'sell' : 'buy'
+    try {
+      await request('/api/paper/orders', { method: 'POST', body: JSON.stringify({ contract: position.contract, product: position.product, side: closeSide, kind: 'market', quantity: String(Math.abs(Number(position.quantity))) }) })
+      setMessage(`Close order sent for ${position.contract}.`)
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Could not close position.') }
+  }
+
+  const marketAge = market ? Math.max(0, Math.floor((clock - market.updatedAt) / 1000)) : null
+  const spread = market?.asks[0] && market?.bids[0] ? Number(market.asks[0].price) - Number(market.bids[0].price) : null
+  const estimatedFee = market && paper ? Number(quantity || 0) * Number(market.mark) * Number(market.multiplier) * Number(paper.takerFeeRate) : 0
+
+  return <div className="app-shell">
+    <header className="topbar">
+      <a className="brand" href="#top" aria-label="Paper Market home"><span className="brand-mark"><CandlestickChart size={19} /></span><span>PAPER<span className="brand-slash">/</span>MARKET</span></a>
+      <div className="topbar-center"><span className="mode-dot" /> SIMULATED EXECUTION <span className="topbar-divider">/</span> GATE PUBLIC DATA</div>
+      <div className="topbar-actions">
+        <div className={`feed-pill ${fresh ? 'is-live' : 'is-down'}`}>{fresh ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{market?.product === 'option' ? (fresh ? 'REST SYNC' : 'OPTIONS OFFLINE') : (fresh ? 'FEED LIVE' : 'FEED WAITING')}</span></div>
+        <button className="icon-button" title="Paper settings" aria-label="Paper settings" onClick={() => setSettingsOpen(true)}><Settings2 size={17} /></button>
+        <button className="reset-button" onClick={() => void resetAccount()}><RotateCcw size={14} /> Reset</button>
+      </div>
+    </header>
+
+    <main id="top" className="workspace">
+      <aside className="market-rail panel">
+        <div className="rail-heading"><div><span className="eyebrow">MARKETS</span><h2>Instruments</h2></div><button className="icon-button" title="Reload products" aria-label="Reload products" onClick={() => setProduct((value) => value === 'perpetual' ? 'option' : 'perpetual')}><RefreshCw size={15} /></button></div>
+        <div className="product-switch" role="tablist" aria-label="Product type">
+          <button className={product === 'perpetual' ? 'selected' : ''} role="tab" aria-selected={product === 'perpetual'} onClick={() => setProduct('perpetual')}>PERP</button>
+          <button className={product === 'option' ? 'selected' : ''} role="tab" aria-selected={product === 'option'} onClick={() => setProduct('option')}>OPTIONS</button>
+        </div>
+        <label className="search-box"><SlidersHorizontal size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find contract" aria-label="Find contract" /><span>{visibleInstruments.length}</span></label>
+        <div className="instrument-head"><span>CONTRACT</span><span>MARK</span></div>
+        <div className="instrument-list">
+          {visibleInstruments.map((item) => <button key={item.contract} className={`instrument-row ${item.contract === selectedContract ? 'active' : ''}`} onClick={() => void selectInstrument(item.contract)}>
+            <span className="instrument-name"><strong>{item.contract}</strong>{product === 'option' && <small>{item.call ? 'CALL' : 'PUT'} · {money(item.strike ?? '0', 0)} · {expiry(item.expiryAt)}</small>}</span>
+            <span className="instrument-mark">{money(item.mark ?? '0', product === 'option' ? 4 : 2)}</span>
+          </button>)}
+          {!visibleInstruments.length && <div className="empty-note">No matching contracts</div>}
+        </div>
+        <div className="rail-foot"><ShieldCheck size={14} /> PUBLIC MARKET DATA ONLY</div>
+      </aside>
+
+      <section className="market-column">
+        <section className="ticker-panel panel">
+          <div className="contract-title"><div className="contract-icon">{product === 'option' ? 'O' : 'P'}</div><div><div className="contract-line"><h1>{selectedContract}</h1><ChevronDown size={16} /></div><span className="subline">{product === 'option' ? 'GATE OPTIONS' : 'USDT-M PERPETUAL'} <span className="dot-separator">·</span> PAPER</span></div></div>
+          <div className="main-price"><span className="eyebrow">LAST TRADED</span><strong>{market ? money(market.last, product === 'option' ? 4 : 2) : '—'}</strong><span className="price-note">Mark {market ? money(market.mark, product === 'option' ? 4 : 2) : '—'}</span></div>
+          <div className="ticker-stat"><span>INDEX</span><strong>{market ? money(market.index, 2) : '—'}</strong></div>
+          <div className="ticker-stat"><span>SPREAD</span><strong>{spread === null ? '—' : money(spread, product === 'option' ? 4 : 2)}</strong></div>
+          {product === 'perpetual' ? <div className="ticker-stat"><span>FUNDING / NEXT</span><strong className={Number(market?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{market?.fundingRate ? `${(Number(market.fundingRate) * 100).toFixed(4)}%` : '—'}</strong><small>{market?.nextFundingAt ? new Date(market.nextFundingAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</small></div> : <div className="ticker-stat"><span>IMPLIED VOL</span><strong>{market?.options?.impliedVolatility ? `${(Number(market.options.impliedVolatility) * 100).toFixed(2)}%` : '—'}</strong></div>}
+          <div className="feed-age"><span className={`pulse ${fresh ? 'active' : ''}`} />{marketAge === null ? 'No feed' : fresh ? `${marketAge}s` : 'Stale'}</div>
+        </section>
+        {market?.options && <section className="greeks-strip panel"><span className="greeks-title">OPTION GREEKS</span><Greek label="DELTA" value={market.options.delta} /><Greek label="GAMMA" value={market.options.gamma} /><Greek label="VEGA" value={market.options.vega} /><Greek label="THETA" value={market.options.theta} /><Greek label="EXPIRY" value={expiry(market.options.expiryAt)} /></section>}
+        <section className="book-panel panel">
+          <div className="section-head"><div><span className="eyebrow">LIVE MARKET</span><h2>Order book</h2></div><span className="book-depth">{market?.bids.length ?? 0} × {market?.asks.length ?? 0} LEVELS</span></div>
+          <div className="book-columns"><span>PRICE <small>USDT</small></span><span>SIZE <small>CONTRACTS</small></span><span>TOTAL <small>USDT</small></span></div>
+          <div className="depth-list asks">{market?.asks.slice(0, 8).reverse().map((level, index) => <DepthRow key={`a-${level.price}`} level={level} side="sell" multiplier={market.multiplier} max={maxDepth(market)} delay={index} />)}</div>
+          <div className="mid-price"><strong>{market ? money(market.mark, product === 'option' ? 4 : 2) : '—'}</strong><span>MARK PRICE</span></div>
+          <div className="depth-list bids">{market?.bids.slice(0, 8).map((level, index) => <DepthRow key={`b-${level.price}`} level={level} side="buy" multiplier={market.multiplier} max={maxDepth(market)} delay={index} />)}</div>
+          {(!market || (!market.asks.length && !market.bids.length)) && <div className="book-empty"><LoaderCircle size={16} className="spin" /> Waiting for Gate order book snapshot</div>}
+          <div className="book-footer"><span>Source <b>{market?.source === 'gate-websocket' ? 'Gate WebSocket' : market?.source === 'gate-rest' ? 'Gate REST' : '—'}</b></span><span>Updated <b>{market ? shortTime(market.updatedAt) : '—'}</b></span></div>
+        </section>
+        <section className="activity-panel panel">
+          <div className="activity-tabs" role="tablist" aria-label="Account activity">{(['positions', 'orders', 'fills', 'ledger'] as View[]).map((view) => <button key={view} className={activeView === view ? 'active' : ''} role="tab" aria-selected={activeView === view} onClick={() => setActiveView(view)}>{view}<span>{countFor(view, paper)}</span></button>)}</div>
+          <div className="table-wrap">{activeView === 'positions' && <PositionsView positions={paper?.positions ?? []} onClose={(position) => void closePosition(position)} />}{activeView === 'orders' && <OrdersView orders={paper?.orders ?? []} onCancel={(id) => void cancelOrder(id)} />}{activeView === 'fills' && <FillsView fills={paper?.fills ?? []} />}{activeView === 'ledger' && <LedgerView entries={paper?.ledger ?? []} />}</div>
+        </section>
+      </section>
+
+      <aside className="ticket-column">
+        <section className="account-panel panel"><div className="section-head compact"><div><span className="eyebrow">PRACTICE ACCOUNT</span><h2>USDT balance</h2></div><span className="paper-label">SIM</span></div><strong className="equity-value">{metrics ? money(metrics.equity) : '—'} <small>USDT</small></strong><div className="account-metrics"><Metric label="Wallet" value={metrics ? money(metrics.balance) : '—'} /><Metric label="Unrealized PnL" value={metrics ? money(metrics.unrealizedPnl) : '—'} tone={Number(metrics?.unrealizedPnl ?? 0) >= 0 ? 'positive' : 'negative'} /><Metric label="Available" value={metrics ? money(metrics.availableMargin) : '—'} /><Metric label="Used margin" value={metrics ? money(metrics.usedMargin) : '—'} /></div></section>
++        <section className="order-panel panel">
++          <div className="section-head compact"><div><span className="eyebrow">ORDER TICKET</span><h2>Place paper order</h2></div><span className="ticket-status"><span className={`pulse ${fresh ? 'active' : ''}`} />{fresh ? 'READY' : 'WAITING'}</span></div>
++          <div className="side-switch" role="group" aria-label="Order side"><button className={side === 'buy' ? 'buy selected' : 'buy'} onClick={() => setSide('buy')}><ArrowUpRight size={15} /> Buy / Long</button><button className={side === 'sell' ? 'sell selected' : 'sell'} onClick={() => setSide('sell')}><ArrowDownRight size={15} /> Sell / Short</button></div>
++          <div className="order-kind" role="group" aria-label="Order type"><button className={orderKind === 'market' ? 'selected' : ''} onClick={() => setOrderKind('market')}>Market</button><button className={orderKind === 'limit' ? 'selected' : ''} onClick={() => setOrderKind('limit')}>Limit</button></div>
++          <form onSubmit={(event) => void submitOrder(event)} className="ticket-form">
++            {orderKind === 'limit' && <label className="field-label">Limit price <span>USDT</span><input type="number" min="0" step={market?.priceStep ?? '0.01'} value={limitPrice} onChange={(event) => setLimitPrice(event.target.value)} placeholder={market?.mark ?? '0.00'} required />}</label>}
++            <label className="field-label">Quantity <span>CONTRACTS</span><input type="number" min={market?.minSize ?? '1'} step={market?.sizeStep ?? '1'} value={quantity} onChange={(event) => setQuantity(event.target.value)} required /></label>
++            <div className="leverage-row"><span>Leverage</span><select value={paper?.leverage ?? 5} onChange={(event) => void saveSettings({ leverage: Number(event.target.value) })} aria-label="Paper leverage">{[1, 2, 3, 5, 10, 20, 50, 100].map((value) => <option key={value} value={value}>{value}×</option>)}</select></div>
++            <div className="estimate-box"><div><span>Est. notional</span><b>{market ? money(Number(quantity || 0) * Number(market.mark) * Number(market.multiplier)) : '—'} USDT</b></div><div><span>Taker fee est.</span><b>{money(estimatedFee)} USDT</b></div><div><span>Extra slippage</span><b>{paper?.slippageBps ?? '2'} bps</b></div></div>
++            <button className={`submit-order ${side}`} type="submit" disabled={!fresh || busy || !market}>{busy ? <LoaderCircle size={17} className="spin" /> : side === 'buy' ? <ArrowUpRight size={17} /> : <ArrowDownRight size={17} />}{busy ? 'Processing' : `${side === 'buy' ? 'Buy / Long' : 'Sell / Short'} ${selectedContract}`}</button>
++            {!fresh && <p className="disabled-reason"><CircleHelp size={13} /> Orders unlock when fresh Gate market data is available.</p>}
++          </form>
++        </section>
++        <section className="recent-trades panel"><div className="section-head compact"><div><span className="eyebrow">PUBLIC TAPE</span><h2>Recent trades</h2></div><Activity size={16} className="muted-icon" /></div><div className="trade-head"><span>PRICE</span><span>SIZE</span><span>TIME</span></div><div className="trade-list">{market?.trades.slice(0, 8).map((trade) => <div className="trade-row" key={trade.id}><strong className={trade.side === 'buy' ? 'positive' : 'negative'}>{money(trade.price, product === 'option' ? 4 : 2)}</strong><span>{money(trade.size, 0)}</span><time>{shortTime(trade.time)}</time></div>)}{!market?.trades.length && <div className="empty-note">Waiting for public trades</div>}</div></section>
++      </aside>
++    </main>
++
++    <footer className="statusbar"><span><span className={`pulse ${socketOnline ? 'active' : ''}`} />{socketOnline ? 'APP SOCKET CONNECTED' : 'APP SOCKET DISCONNECTED'}</span><span><ShieldCheck size={13} /> PAPER EXECUTION ONLY</span><span><Clock3 size={13} /> {new Date(clock).toLocaleTimeString()}</span><span className="status-warning">Simulated fills do not model Gate queue priority</span></footer>
++    {message && <div className={`toast ${message.includes('unavailable') || message.includes('stale') || message.includes('rejected') ? 'warning' : ''}`} role="status">{message}<button aria-label="Dismiss" className="icon-button" onClick={() => setMessage('')}><X size={14} /></button></div>}
++    {settingsOpen && <div className="settings-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}><section className="settings-drawer panel" aria-label="Paper trading settings"><div className="drawer-head"><div><span className="eyebrow">SIMULATOR</span><h2>Paper settings</h2></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><p className="settings-copy">Rates below are configurable simulation assumptions. They do not change Gate account fees.</p><SettingInput label="Maker fee rate" value={paper?.makerFeeRate ?? '0.0002'} suffix="fraction" onSave={(value) => void saveSettings({ makerFeeRate: value })} /><SettingInput label="Taker fee rate" value={paper?.takerFeeRate ?? '0.0005'} suffix="fraction" onSave={(value) => void saveSettings({ takerFeeRate: value })} /><SettingInput label="Additional slippage" value={paper?.slippageBps ?? '2'} suffix="bps" onSave={(value) => void saveSettings({ slippageBps: value })} /><div className="risk-note"><Gauge size={16} /><span>Initial and liquidation margin are educational estimates. Gate's risk engine is not replicated.</span></div><button className="reset-wide" onClick={() => void resetAccount()}><RotateCcw size={15} /> Reset practice account</button></section></div>}
++  </div>
++}
++
++function Greek({ label, value }: { label: string; value: string | number | null }) { return <div className="greek"><span>{label}</span><strong>{value === null || value === undefined ? '—' : typeof value === 'number' ? value.toFixed(4) : value}</strong></div> }
++function Metric({ label, value, tone }: { label: string; value: string; tone?: string }) { return <div className="metric"><span>{label}</span><strong className={tone}>{value}</strong></div> }
++function maxDepth(market: Market) { return Math.max(1, ...market.bids.concat(market.asks).slice(0, 16).map((level) => Number(level.size))) }
++function DepthRow({ level, side, multiplier, max, delay }: { level: Level; side: Side; multiplier: string; max: number; delay: number }) {
++  const size = Number(level.size); const width = Math.max(2, Math.min(100, size / max * 100))
++  return <div className={`depth-row ${side}`} style={{ '--depth-width': `${width}%`, '--row-delay': `${delay * 25}ms` } as CSSProperties}><span className="depth-price">{money(level.price, Number(level.price) < 1 ? 4 : 2)}</span><span>{money(level.size, 2)}</span><span>{money(size * Number(level.price) * Number(multiplier), 2)}</span><i /></div>
++}
++function countFor(view: View, paper: PaperState | null) {
++  if (!paper) return 0
++  if (view === 'positions') return paper.positions.length
++  if (view === 'orders') return paper.orders.filter((order) => order.status === 'open').length
++  if (view === 'fills') return paper.fills.length
++  return paper.ledger.length
++}
++function PositionsView({ positions, onClose }: { positions: Position[]; onClose: (position: Position) => void }) {
++  if (!positions.length) return <div className="empty-state"><LayoutDashboard size={19} /><strong>No open positions</strong><span>Paper fills will appear here.</span></div>
++  return <table><thead><tr><th>CONTRACT</th><th>SIDE</th><th>SIZE</th><th>ENTRY</th><th>MARK</th><th>UNREALIZED PNL</th><th /></tr></thead><tbody>{positions.map((position) => { const pnl = (Number(position.markPrice) - Number(position.entryPrice)) * Number(position.quantity) * Number(position.multiplier); return <tr key={position.contract}><td className="strong-cell">{position.contract}</td><td className={Number(position.quantity) > 0 ? 'positive' : 'negative'}>{Number(position.quantity) > 0 ? 'LONG' : 'SHORT'}</td><td>{money(Math.abs(Number(position.quantity)), 4)}</td><td>{money(position.entryPrice, 2)}</td><td>{money(position.markPrice, 2)}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{money(pnl)}</td><td><button className="close-position" onClick={() => onClose(position)}>Close</button></td></tr> })}</tbody></table>
++}
++function OrdersView({ orders, onCancel }: { orders: Order[]; onCancel: (id: string) => void }) {
++  if (!orders.length) return <div className="empty-state"><History size={19} /><strong>No orders yet</strong><span>Paper orders remain separate from Gate.</span></div>
++  return <table><thead><tr><th>TIME</th><th>CONTRACT</th><th>SIDE / TYPE</th><th>PRICE</th><th>SIZE / LEFT</th><th>STATUS</th><th /></tr></thead><tbody>{orders.slice(0, 20).map((order) => <tr key={order.id}><td>{shortTime(order.createdAt)}</td><td className="strong-cell">{order.contract}</td><td className={order.side === 'buy' ? 'positive' : 'negative'}>{order.side.toUpperCase()} / {order.kind.toUpperCase()}</td><td>{order.limitPrice ? money(order.limitPrice, 2) : 'Market'}</td><td>{money(order.quantity, 4)} / {money(order.remaining, 4)}</td><td><span className={`order-state ${order.status}`}>{order.status}</span></td><td>{order.status === 'open' && <button className="close-position" onClick={() => onCancel(order.id)}>Cancel</button>}</td></tr>)}</tbody></table>
++}
++function FillsView({ fills }: { fills: Fill[] }) {
++  if (!fills.length) return <div className="empty-state"><Activity size={19} /><strong>No fills yet</strong><span>Execution details and slippage will be recorded here.</span></div>
++  return <table><thead><tr><th>TIME</th><th>CONTRACT</th><th>SIDE</th><th>QTY</th><th>PRICE</th><th>LIQUIDITY</th><th>FEE</th><th>SLIPPAGE</th></tr></thead><tbody>{fills.slice(0, 30).map((fill) => <tr key={fill.id}><td>{shortTime(fill.createdAt)}</td><td className="strong-cell">{fill.contract}</td><td className={fill.side === 'buy' ? 'positive' : 'negative'}>{fill.side.toUpperCase()}</td><td>{money(fill.quantity, 4)}</td><td>{money(fill.price, 4)}</td><td>{fill.liquidity.toUpperCase()}</td><td>{money(fill.fee, 4)}</td><td>{fill.slippageBps} bps</td></tr>)}</tbody></table>
++}
++function LedgerView({ entries }: { entries: LedgerEntry[] }) {
++  if (!entries.length) return <div className="empty-state"><History size={19} /><strong>No account activity</strong><span>Fees, realized PnL and funding post as separate entries.</span></div>
++  return <table><thead><tr><th>TIME</th><th>TYPE</th><th>CONTRACT</th><th>DETAIL</th><th>CHANGE</th><th>BALANCE</th></tr></thead><tbody>{entries.slice(0, 40).map((entry) => <tr key={entry.id}><td>{shortTime(entry.createdAt)}</td><td><span className="ledger-type">{entry.type.replaceAll('_', ' ').toUpperCase()}</span></td><td className="strong-cell">{entry.contract ?? 'ACCOUNT'}</td><td>{entry.description}</td><td className={Number(entry.amount) >= 0 ? 'positive' : 'negative'}>{Number(entry.amount) >= 0 ? '+' : ''}{money(entry.amount, 4)}</td><td>{money(entry.balance, 2)}</td></tr>)}</tbody></table>
++}
++function SettingInput({ label, value, suffix, onSave }: { label: string; value: string; suffix: string; onSave: (value: string) => void }) {
++  const [draft, setDraft] = useState(value)
++  useEffect(() => setDraft(value), [value])
++  return <label className="setting-row"><span>{label}</span><span className="setting-control"><input type="number" min="0" step="any" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={() => onSave(draft)} /><small>{suffix}</small></span></label>
++}
++
++export default App

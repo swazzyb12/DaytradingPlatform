@@ -1,0 +1,14 @@
+{
+  "name": "gate-paper-trader",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n api,ui -c cyan,green \"npm:dev:api\" \"npm:dev:ui\"",
+    "dev:api": "npm --prefix backend run dev",
+    "dev:ui": "npm --prefix frontend run dev -- --host 127.0.0.1",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "test": "npm --prefix backend test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
