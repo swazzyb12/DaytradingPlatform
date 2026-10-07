@@ -10,6 +10,7 @@ import './App.css'
 type Product = 'perpetual' | 'delivery' | 'option'
 type Side = 'buy' | 'sell'
 type View = 'positions' | 'orders' | 'fills' | 'ledger'
+type MarketRemainderMode = 'cancel' | 'slippage-protected-rest' | 'aggressive-chase'
 interface Level { price: string; size: string }
 interface Market {
   contract: string; product: Product; source: string; connected: boolean; updatedAt: number; expiryAt?: number | null
@@ -26,13 +27,24 @@ interface Instrument {
   mark?: string; priceStep?: string; sizeStep?: string; minSize?: string; volume24hQuote?: string; change24hPct?: string; change24hPrice?: string
 }
 interface Order { id: string; contract: string; product: Product; side: Side; kind: 'market' | 'limit'; quantity: string; remaining: string; limitPrice: string | null; status: string; createdAt: number }
-interface Position { contract: string; product: Product; quantity: string; entryPrice: string; multiplier: string; markPrice: string; updatedAt: number; liquidationTriggeredAt?: number }
+interface Position { contract: string; product: Product; quantity: string; entryPrice: string; multiplier: string; markPrice: string; updatedAt: number; leverage?: number; liquidationTriggeredAt?: number }
 interface PositionRisk { status: 'ready' | 'unavailable' | 'over_limit'; formulaVersion: string; multiplier: string; reason?: string; tier: number | null; positionNotional: string | null; initialMargin: string | null; maintenanceMargin: string | null; marginRatio: string | null; liquidationPrice: string | null; distanceToLiquidationPct: string | null; markUpdatedAt: number | null; riskUpdatedAt: number | null }
 interface RiskEvent { id: string; contract: string; status: 'complete' | 'partial' | 'no_depth'; residualQuantity: string; createdAt: number; note: string }
 interface Fill { id: string; contract: string; side: Side; quantity: string; price: string; fee: string; liquidity: string; createdAt: number; slippageBps: string }
 interface LedgerEntry { id: string; type: string; contract: string | null; amount: string; balance: string; description: string; createdAt: number }
-interface PaperState { balance: string; positionMode: 'one-way' | 'hedge'; leverage: number; warningMarginRatio: number; makerFeeRate: string; takerFeeRate: string; slippageBps: string; orders: Order[]; positions: Position[]; fills: Fill[]; ledger: LedgerEntry[]; riskEvents?: RiskEvent[] }
-interface Metrics { balance: string; unrealizedPnl: string; equity: string; usedMargin: string; availableMargin: string; positionRisks?: Record<string, PositionRisk | null> }
+interface PaperState { balance: string; positionMode: 'one-way' | 'hedge'; leverage: number; warningMarginRatio: number; makerFeeRate: string; takerFeeRate: string; slippageBps: string; marketRemainderMode: MarketRemainderMode; orders: Order[]; positions: Position[]; fills: Fill[]; ledger: LedgerEntry[]; riskEvents?: RiskEvent[] }
+interface Metrics {
+  balance: string
+  realizedPnl: string
+  allTimePnl: string
+  unrealizedPnl: string
+  pnl24hRealized: string
+  pnl24hUnrealized: string
+  equity: string
+  usedMargin: string
+  availableMargin: string
+  positionRisks?: Record<string, PositionRisk | null>
+}
 interface TileLayout { x: number; y: number; width: number; height: number }
 
 const API = import.meta.env.VITE_API_URL ?? window.location.origin
@@ -186,7 +198,7 @@ function App() {
     try { await request(`/api/paper/orders/${encodeURIComponent(id)}`, { method: 'DELETE' }); setMessage('Paper order cancelled.') }
     catch (error) { setMessage(error instanceof Error ? error.message : 'Could not cancel order.') }
   }
-  async function saveSettings(patch: Partial<Pick<PaperState, 'leverage' | 'warningMarginRatio' | 'makerFeeRate' | 'takerFeeRate' | 'slippageBps'>>) {
+  async function saveSettings(patch: Partial<Pick<PaperState, 'leverage' | 'warningMarginRatio' | 'makerFeeRate' | 'takerFeeRate' | 'slippageBps' | 'marketRemainderMode'>>) {
     try {
       const value = await request<{ state: PaperState; metrics: Metrics }>('/api/paper/settings', { method: 'PATCH', body: JSON.stringify(patch) })
       setPaper(value.state); setMetrics(value.metrics); setMessage('Paper settings saved.')
@@ -236,6 +248,9 @@ function App() {
   const riskIncreaseBlocked = riskDataUnavailable && !orderReducesPosition && estimatedContracts > 0
   const selectedRisk = metrics?.positionRisks?.[selectedContract] ?? null
   const latestRiskEvent = paper?.riskEvents?.find((event) => event.contract === selectedContract)
+  const allTimePnlTone = Number(metrics?.allTimePnl ?? 0) >= 0 ? 'positive' : 'negative'
+  const pnl24hRealizedTone = Number(metrics?.pnl24hRealized ?? 0) >= 0 ? 'positive' : 'negative'
+  const pnl24hUnrealizedTone = Number(metrics?.pnl24hUnrealized ?? 0) >= 0 ? 'positive' : 'negative'
 
   return <div className="app-shell">
     <header className="topbar">
@@ -297,9 +312,9 @@ function App() {
 
       <Rnd className="layout-tile" bounds="parent" disableDragging={!layoutEdit} enableResizing={layoutEdit} size={{ width: tileLayout.ticket.width, height: tileLayout.ticket.height }} position={{ x: tileLayout.ticket.x, y: tileLayout.ticket.y }} onDragStop={(_, data) => updateTile('ticket', { x: data.x, y: data.y })} onResizeStop={(_, __, ref, ___, position) => updateTile('ticket', { width: ref.offsetWidth, height: ref.offsetHeight, x: position.x, y: position.y })}>
       <aside className="ticket-column">
-        <section className="account-panel panel"><div className="section-head compact"><div><span className="eyebrow">PRACTICE ACCOUNT</span><h2>USDT balance</h2></div><span className="paper-label">SIM</span></div><strong className="equity-value">{metrics ? money(metrics.equity) : '—'} <small>USDT</small></strong><div className="account-metrics"><Metric label="Wallet" value={metrics ? money(metrics.balance) : '—'} /><Metric label="Unrealized PnL" value={metrics ? money(metrics.unrealizedPnl) : '—'} tone={Number(metrics?.unrealizedPnl ?? 0) >= 0 ? 'positive' : 'negative'} /><Metric label="Available" value={metrics ? money(metrics.availableMargin) : '—'} /><Metric label="Used margin" value={metrics ? money(metrics.usedMargin) : '—'} /></div>
+        <section className="account-panel panel"><div className="section-head compact"><div><span className="eyebrow">PRACTICE ACCOUNT</span><h2>USDT balance</h2></div><span className="paper-label">SIM</span></div><strong className="equity-value">{metrics ? money(metrics.equity) : '—'} <small>USDT</small></strong><div className="account-metrics"><Metric label="All-time PnL" value={metrics ? money(metrics.allTimePnl) : '—'} tone={allTimePnlTone} /><Metric label="Wallet" value={metrics ? money(metrics.balance) : '—'} /><Metric label="Realized PnL" value={metrics ? money(metrics.realizedPnl) : '—'} tone={Number(metrics?.realizedPnl ?? 0) >= 0 ? 'positive' : 'negative'} /><Metric label="Unrealized PnL" value={metrics ? money(metrics.unrealizedPnl) : '—'} tone={Number(metrics?.unrealizedPnl ?? 0) >= 0 ? 'positive' : 'negative'} /><Metric label="24h realized" value={metrics ? money(metrics.pnl24hRealized) : '—'} tone={pnl24hRealizedTone} /><Metric label="24h unrealized" value={metrics ? money(metrics.pnl24hUnrealized) : '—'} tone={pnl24hUnrealizedTone} /><Metric label="Available" value={metrics ? money(metrics.availableMargin) : '—'} /><Metric label="Used margin" value={metrics ? money(metrics.usedMargin) : '—'} /></div>
           {product === 'perpetual' && <div className="risk-readout"><div className="risk-heading"><span>ISOLATED RISK · {selectedContract}</span><strong className={selectedRisk?.status === 'ready' ? 'positive' : 'risk-muted'}>{selectedPosition ? selectedPosition.liquidationTriggeredAt ? 'FROZEN' : selectedRisk?.status === 'ready' ? `TIER ${selectedRisk.tier}` : 'UNAVAILABLE' : market?.riskUpdatedAt && clock - market.riskUpdatedAt <= 5 * 60_000 ? 'NO POSITION' : 'TIER DATA UNAVAILABLE'}</strong></div>
-            {selectedPosition && selectedRisk?.status === 'ready' ? <div className="risk-grid"><Metric label="Margin ratio" value={`${money(selectedRisk.marginRatio ?? '0')}%`} tone={Number(selectedRisk.marginRatio) <= 110 ? 'negative' : 'positive'} /><Metric label="Liq. price" value={`${priceText(selectedRisk.liquidationPrice, market?.mark)} USDT`} /><Metric label="Initial margin" value={`${money(selectedRisk.initialMargin ?? '0')} USDT`} /><Metric label="Maintenance" value={`${money(selectedRisk.maintenanceMargin ?? '0')} USDT`} /><Metric label="Distance" value={`${money(selectedRisk.distanceToLiquidationPct ?? '0')}%`} /><Metric label="Tier cap" value={selectedRisk.tier ? `${selectedRisk.tier} / ${money(market?.riskTiers?.find((tier) => tier.tier === selectedRisk.tier)?.riskLimit ?? '0')} USDT` : '—'} /></div> : <p className="risk-message">{selectedPosition ? selectedRisk?.reason ?? 'Risk inputs are not available.' : market?.riskDataError ?? (market?.riskUpdatedAt ? `Gate tier data updated ${Math.max(0, Math.floor((clock - market.riskUpdatedAt) / 1000))}s ago.` : 'Waiting for fresh Gate risk tiers.')}</p>}
+            {selectedPosition && selectedRisk?.status === 'ready' ? <div className="risk-grid"><Metric label="Margin ratio" value={`${money(selectedRisk.marginRatio ?? '0')}%`} tone={Number(selectedRisk.marginRatio) <= 110 ? 'negative' : 'positive'} /><Metric label="Liq. price" value={`${priceText(selectedRisk.liquidationPrice ?? undefined, market?.mark)} USDT`} /><Metric label="Initial margin" value={`${money(selectedRisk.initialMargin ?? '0')} USDT`} /><Metric label="Maintenance" value={`${money(selectedRisk.maintenanceMargin ?? '0')} USDT`} /><Metric label="Distance" value={`${money(selectedRisk.distanceToLiquidationPct ?? '0')}%`} /><Metric label="Tier cap" value={selectedRisk.tier ? `${selectedRisk.tier} / ${money(market?.riskTiers?.find((tier) => tier.tier === selectedRisk.tier)?.riskLimit ?? '0')} USDT` : '—'} /></div> : <p className="risk-message">{selectedPosition ? selectedRisk?.reason ?? 'Risk inputs are not available.' : market?.riskDataError ?? (market?.riskUpdatedAt ? `Gate tier data updated ${Math.max(0, Math.floor((clock - market.riskUpdatedAt) / 1000))}s ago.` : 'Waiting for fresh Gate risk tiers.')}</p>}
             {selectedPosition && selectedRisk?.status === 'ready' && <small className="risk-provenance">{selectedRisk.formulaVersion} · multiplier {selectedRisk.multiplier} · Gate tiers {selectedRisk.riskUpdatedAt ? `${Math.max(0, Math.floor((clock - selectedRisk.riskUpdatedAt) / 1000))}s old` : 'unknown'} · mark {selectedRisk.markUpdatedAt ? `${Math.max(0, Math.floor((clock - selectedRisk.markUpdatedAt) / 1000))}s old` : 'unknown'}</small>}
             {selectedPosition && selectedRisk?.status === 'ready' && Number(selectedRisk.marginRatio) > 100 && Number(selectedRisk.marginRatio) <= (paper?.warningMarginRatio ?? 110) && <p className="risk-alert">Warning: isolated margin ratio is within the configured warning threshold.</p>}
             {selectedPosition?.liquidationTriggeredAt && <p className="risk-alert">Simulated liquidation triggered. Residual: {money(selectedPosition.quantity, 4)} contracts.</p>}
@@ -331,7 +346,7 @@ function App() {
 
     <footer className="statusbar"><span><span className={`pulse ${socketOnline ? 'active' : ''}`} />{socketOnline ? 'APP SOCKET CONNECTED' : 'APP SOCKET DISCONNECTED'}</span><span><ShieldCheck size={13} /> PAPER EXECUTION ONLY</span><span><Clock3 size={13} /> {new Date(clock).toLocaleTimeString()}</span><span className="status-warning">Simulated fills do not model Gate queue priority</span></footer>
     {message && <div className={`toast ${message.includes('unavailable') || message.includes('stale') || message.includes('rejected') ? 'warning' : ''}`} role="status">{message}<button aria-label="Dismiss" className="icon-button" onClick={() => setMessage('')}><X size={14} /></button></div>}
-    {settingsOpen && <div className="settings-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}><section className="settings-drawer panel" aria-label="Paper trading settings"><div className="drawer-head"><div><span className="eyebrow">SIMULATOR</span><h2>Paper settings</h2></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><p className="settings-copy">Rates below are configurable simulation assumptions. They do not change Gate account fees.</p><SettingInput label="Maker fee rate" value={paper?.makerFeeRate ?? '0.0002'} suffix="fraction" onSave={(value) => void saveSettings({ makerFeeRate: value })} /><SettingInput label="Taker fee rate" value={paper?.takerFeeRate ?? '0.0005'} suffix="fraction" onSave={(value) => void saveSettings({ takerFeeRate: value })} /><SettingInput label="Additional slippage" value={paper?.slippageBps ?? '2'} suffix="bps" onSave={(value) => void saveSettings({ slippageBps: value })} /><SettingInput label="Risk warning ratio" value={String(paper?.warningMarginRatio ?? 110)} suffix="%" onSave={(value) => void saveSettings({ warningMarginRatio: Number(value) })} /><div className="risk-note"><Gauge size={16} /><span>Initial and liquidation margin are educational estimates. Gate's risk engine is not replicated.</span></div><button className="reset-wide" onClick={() => void resetAccount()}><RotateCcw size={15} /> Reset practice account</button></section></div>}
+    {settingsOpen && <div className="settings-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false) }}><section className="settings-drawer panel" aria-label="Paper trading settings"><div className="drawer-head"><div><span className="eyebrow">SIMULATOR</span><h2>Paper settings</h2></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><p className="settings-copy">Rates below are configurable simulation assumptions. They do not change Gate account fees.</p><SettingInput label="Maker fee rate" value={paper?.makerFeeRate ?? '0.0002'} suffix="fraction" onSave={(value) => void saveSettings({ makerFeeRate: value })} /><SettingInput label="Taker fee rate" value={paper?.takerFeeRate ?? '0.0005'} suffix="fraction" onSave={(value) => void saveSettings({ takerFeeRate: value })} /><SettingInput label="Additional slippage" value={paper?.slippageBps ?? '2'} suffix="bps" onSave={(value) => void saveSettings({ slippageBps: value })} /><SettingSelect label="Market remainder handling" value={paper?.marketRemainderMode ?? 'cancel'} onSave={(value) => void saveSettings({ marketRemainderMode: value })} options={[{ value: 'cancel', label: 'Cancel remainder (exchange-like)' }, { value: 'slippage-protected-rest', label: 'Rest remainder as protected limit' }, { value: 'aggressive-chase', label: 'Chase remainder with protected repricing' }]} /><SettingInput label="Risk warning ratio" value={String(paper?.warningMarginRatio ?? 110)} suffix="%" onSave={(value) => void saveSettings({ warningMarginRatio: Number(value) })} /><div className="risk-note"><Gauge size={16} /><span>Initial and liquidation margin are educational estimates. Gate's risk engine is not replicated.</span></div><button className="reset-wide" onClick={() => void resetAccount()}><RotateCcw size={15} /> Reset practice account</button></section></div>}
   </div>
 }
 
@@ -357,7 +372,7 @@ function countFor(view: View, paper: PaperState | null) {
 }
 function PositionsView({ positions, market, risks, onClose }: { positions: Position[]; market: Market | null; risks: Record<string, PositionRisk | null>; onClose: (position: Position) => void }) {
   if (!positions.length) return <div className="empty-state"><LayoutDashboard size={19} /><strong>No open positions</strong><span>Paper fills will appear here.</span></div>
-  return <table><thead><tr><th>CONTRACT</th><th>SIDE</th><th>SIZE</th><th>NOTIONAL USDT</th><th>ENTRY</th><th>MARK</th><th>UNREALIZED PNL</th><th>MMR</th><th>LIQ. PRICE</th><th /></tr></thead><tbody>{positions.map((position) => { const marked = Number(position.markPrice) > 0; const notional = marked ? Math.abs(Number(position.quantity)) * Number(position.markPrice) * Number(position.multiplier) : null; const pnl = marked ? (Number(position.markPrice) - Number(position.entryPrice)) * Number(position.quantity) * Number(position.multiplier) : null; const risk = risks[position.contract]; return <tr key={position.contract}><td className="strong-cell">{position.contract}{position.liquidationTriggeredAt && <small className="frozen-label">FROZEN</small>}</td><td className={Number(position.quantity) > 0 ? 'positive' : 'negative'}>{Number(position.quantity) > 0 ? 'LONG' : 'SHORT'}</td><td>{money(Math.abs(Number(position.quantity)), 4)}</td><td>{notional === null ? '—' : money(notional, 2)}</td><td>{priceText(position.entryPrice, market?.mark)}</td><td>{priceText(position.markPrice, market?.mark)}</td><td className={pnl === null ? '' : pnl >= 0 ? 'positive' : 'negative'}>{pnl === null ? '—' : `${pnl >= 0 ? '+' : ''}${money(pnl)}`}</td><td>{risk?.status === 'ready' ? `${money(risk.marginRatio ?? '0')}%` : '—'}</td><td>{risk?.status === 'ready' && risk.liquidationPrice ? priceText(risk.liquidationPrice, market?.mark) : '—'}</td><td><button className="close-position" onClick={() => onClose(position)}>Close</button></td></tr> })}</tbody></table>
+  return <table><thead><tr><th>CONTRACT</th><th>SIDE</th><th>LEV</th><th>SIZE</th><th>NOTIONAL USDT</th><th>ENTRY</th><th>MARK</th><th>UNREALIZED PNL</th><th>MMR</th><th>LIQ. PRICE</th><th /></tr></thead><tbody>{positions.map((position) => { const marked = Number(position.markPrice) > 0; const notional = marked ? Math.abs(Number(position.quantity)) * Number(position.markPrice) * Number(position.multiplier) : null; const pnl = marked ? (Number(position.markPrice) - Number(position.entryPrice)) * Number(position.quantity) * Number(position.multiplier) : null; const risk = risks[position.contract]; return <tr key={position.contract}><td className="strong-cell">{position.contract}{position.liquidationTriggeredAt && <small className="frozen-label">FROZEN</small>}</td><td className={Number(position.quantity) > 0 ? 'positive' : 'negative'}>{Number(position.quantity) > 0 ? 'LONG' : 'SHORT'}</td><td>{position.leverage ? `${position.leverage}x` : '—'}</td><td>{money(Math.abs(Number(position.quantity)), 4)}</td><td>{notional === null ? '—' : money(notional, 2)}</td><td>{priceText(position.entryPrice, market?.mark)}</td><td>{priceText(position.markPrice, market?.mark)}</td><td className={pnl === null ? '' : pnl >= 0 ? 'positive' : 'negative'}>{pnl === null ? '—' : `${pnl >= 0 ? '+' : ''}${money(pnl)}`}</td><td>{risk?.status === 'ready' ? `${money(risk.marginRatio ?? '0')}%` : '—'}</td><td>{risk?.status === 'ready' && risk.liquidationPrice ? priceText(risk.liquidationPrice, market?.mark) : '—'}</td><td><button className="close-position" onClick={() => onClose(position)}>Close</button></td></tr> })}</tbody></table>
 }
 function OrdersView({ orders, onCancel }: { orders: Order[]; onCancel: (id: string) => void }) {
   if (!orders.length) return <div className="empty-state"><History size={19} /><strong>No orders yet</strong><span>Paper orders remain separate from Gate.</span></div>
@@ -375,6 +390,20 @@ function SettingInput({ label, value, suffix, onSave }: { label: string; value: 
   const [draft, setDraft] = useState(value)
   useEffect(() => setDraft(value), [value])
   return <label className="setting-row"><span>{label}</span><span className="setting-control"><input type="number" min="0" step="any" value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={() => onSave(draft)} /><small>{suffix}</small></span></label>
+}
+
+function SettingSelect({
+  label,
+  value,
+  options,
+  onSave,
+}: {
+  label: string
+  value: MarketRemainderMode
+  options: Array<{ value: MarketRemainderMode; label: string }>
+  onSave: (value: MarketRemainderMode) => void
+}) {
+  return <label className="setting-row"><span>{label}</span><span className="setting-control"><select value={value} onChange={(event) => onSave(event.target.value as MarketRemainderMode)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></span></label>
 }
 
 export default App

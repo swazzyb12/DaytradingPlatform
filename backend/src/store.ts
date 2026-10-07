@@ -13,6 +13,8 @@ export interface PaperStore {
 }
 
 export async function openPaperStore(path = process.env.PAPER_DB_PATH ?? 'data/paper-trading.sqlite'): Promise<PaperStore> {
+  const WRITE_RETRIES = 6;
+  const FLUSH_DEBOUNCE_MS = 350;
   const filePath = resolve(path);
   mkdirSync(dirname(filePath), { recursive: true });
   const SQL = await initSqlJs({ locateFile: (file) => require.resolve(`sql.js/dist/${file}`) });
@@ -21,7 +23,21 @@ export async function openPaperStore(path = process.env.PAPER_DB_PATH ?? 'data/p
   const result = db.exec('SELECT state_json FROM paper_state WHERE id = 1');
   if (result.length === 0) {
     const initial = createInitialState();
-    persist(initial);
+    persistSerialized(JSON.stringify(initial));
+  }
+  let pendingSerialized: string | null = null;
+  let flushTimer: NodeJS.Timeout | null = null;
+  let closed = false;
+
+  function sleep(ms: number) {
+    const channel = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(channel, 0, 0, ms);
+  }
+
+  function retryableWriteError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES' || code === 'UNKNOWN';
   }
 
   function loadState(): PaperState {
@@ -35,16 +51,57 @@ export async function openPaperStore(path = process.env.PAPER_DB_PATH ?? 'data/p
     }
   }
 
+  function persistSerialized(serialized: string) {
+    db.run('INSERT INTO paper_state (id, state_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json', [serialized]);
+    const bytes = Buffer.from(db.export());
+    for (let attempt = 1; attempt <= WRITE_RETRIES; attempt += 1) {
+      try {
+        writeFileSync(filePath, bytes);
+        return;
+      } catch (error) {
+        if (!retryableWriteError(error) || attempt === WRITE_RETRIES) throw error;
+        sleep(20 * attempt);
+      }
+    }
+  }
+
+  function flushPending() {
+    if (closed || pendingSerialized === null) return;
+    const serialized = pendingSerialized;
+    pendingSerialized = null;
+    try {
+      persistSerialized(serialized);
+    } catch (error) {
+      pendingSerialized = serialized;
+      console.error('Paper store flush failed; keeping in-memory state and retrying on next save.', error);
+    }
+  }
+
+  function scheduleFlush() {
+    if (closed || flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flushPending();
+    }, FLUSH_DEBOUNCE_MS);
+  }
+
   function persist(state: PaperState) {
-    db.run('INSERT INTO paper_state (id, state_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json', [JSON.stringify(state)]);
-    writeFileSync(filePath, Buffer.from(db.export()));
+    if (closed) return;
+    pendingSerialized = JSON.stringify(state);
+    scheduleFlush();
   }
 
   return {
     load: loadState,
     save: persist,
     close() {
-      persist(loadState());
+      closed = true;
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = null;
+      if (pendingSerialized !== null) {
+        persistSerialized(pendingSerialized);
+        pendingSerialized = null;
+      }
       db.close();
     },
   };

@@ -37,6 +37,34 @@ test('resting limits fill only when a qualifying opposing trade arrives', () => 
   assert.equal(state.fills[0].liquidity, 'maker');
 });
 
+test('market orders cancel unfilled remainder by default', () => {
+  const state = createInitialState('10000');
+  const thinMarket: MarketSnapshot = { ...market, asks: [{ price: '101', size: '1' }], bids: [{ price: '100', size: '5' }] };
+  const order = placeOrder(state, { contract: thinMarket.contract, side: 'buy', kind: 'market', quantity: '2' }, thinMarket);
+  assert.equal(order.status, 'cancelled');
+  assert.equal(order.kind, 'market');
+  assert.equal(order.remaining, '1');
+  assert.equal(order.limitPrice, null);
+  assert.match(order.note, /unfilled quantity was cancelled/);
+});
+
+test('market remainder mode can keep residual contracts resting', () => {
+  const state = createInitialState('10000');
+  updateSettings(state, { marketRemainderMode: 'slippage-protected-rest' });
+  const thinMarket: MarketSnapshot = { ...market, asks: [{ price: '101', size: '1' }], bids: [{ price: '100', size: '5' }] };
+  const order = placeOrder(state, { contract: thinMarket.contract, side: 'buy', kind: 'market', quantity: '2' }, thinMarket);
+  assert.equal(order.status, 'open');
+  assert.equal(order.kind, 'limit');
+  assert.equal(order.remaining, '1');
+  assert.equal(order.limitPrice, '101');
+  assert.equal(order.remainderMode, 'slippage-protected-rest');
+  assert.match(order.note, /slippage-protected limit order/);
+
+  processTrade(state, thinMarket, { id: 'fill-rest', price: '101', size: '1', side: 'sell', time: Date.now() });
+  assert.equal(order.status, 'filled');
+  assert.equal(order.remaining, '0');
+});
+
 test('partial closes preserve the original entry price for remaining size', () => {
   const state = createInitialState('10000');
   placeOrder(state, { contract: market.contract, side: 'buy', kind: 'market', quantity: '2' }, market);
@@ -216,6 +244,40 @@ test('expired reduce-only triggers cancel without opening reverse exposure', () 
   markToMarket(state, { ...market, mark: '94', bids: [{ price: '93', size: '1' }] });
   assert.equal(expired.status, 'cancelled');
   assert.equal(state.positions.length, 0);
+});
+
+test('trigger-market child follows configured remainder mode', () => {
+  const state = createInitialState('1000');
+  const trigger = placeOrder(state, {
+    contract: market.contract, side: 'buy', kind: 'trigger-market', quantity: '2',
+    triggerPrice: '100', triggerReference: 'mark',
+  }, market);
+  markToMarket(state, { ...market, mark: '100', asks: [{ price: '101', size: '1' }], bids: [{ price: '100', size: '5' }] });
+
+  const child = state.orders.find((item) => item.parentOrderId === trigger.id);
+  assert.ok(child);
+  assert.equal(child?.status, 'cancelled');
+  assert.equal(child?.kind, 'market');
+  assert.equal(child?.remaining, '1');
+});
+
+test('aggressive chase mode reprices remainder with slippage protection', () => {
+  const state = createInitialState('1000');
+  updateSettings(state, { marketRemainderMode: 'aggressive-chase', slippageBps: '10' });
+  const trigger = placeOrder(state, {
+    contract: market.contract, side: 'buy', kind: 'trigger-market', quantity: '2',
+    triggerPrice: '100', triggerReference: 'mark',
+  }, market);
+  markToMarket(state, { ...market, mark: '100', asks: [{ price: '101', size: '1' }], bids: [{ price: '100', size: '5' }] });
+
+  const child = state.orders.find((item) => item.parentOrderId === trigger.id);
+  assert.ok(child);
+  assert.equal(child?.status, 'open');
+  assert.equal(child?.kind, 'limit');
+  assert.equal(child?.remaining, '1');
+  assert.equal(child?.limitPrice, '101.1');
+  markToMarket(state, { ...market, mark: '100', asks: [{ price: '103', size: '1' }], bids: [{ price: '102', size: '5' }] });
+  assert.equal(child?.limitPrice, '103.1');
 });
 
 test('reduce-only trigger cancels when the position closes before the trigger event', () => {

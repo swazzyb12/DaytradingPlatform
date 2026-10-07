@@ -20,9 +20,12 @@ let paper: PaperState = store.load();
 paper.riskEvents ??= [];
 paper.warningMarginRatio ??= 110;
 paper.positionMode ??= 'one-way';
+paper.marketRemainderMode ??= 'cancel';
 const gate = new GateMarketService();
 const clients = new Set<WebSocket>();
 const fundingTimers = new Map<string, { at: number; rate: string; markPrice: string; timer: NodeJS.Timeout }>();
+let watchRefreshPending = false;
+let watchedContractsTimer: NodeJS.Timeout | null = null;
 
 function publish(event: unknown) {
   const message = JSON.stringify(event);
@@ -56,6 +59,46 @@ function scheduleFunding(market: MarketSnapshot) {
     persistAndPublish();
   }, Math.max(0, event.at - Date.now()));
   fundingTimers.set(market.contract, { ...event, timer });
+}
+
+function collectWatchedContracts() {
+  const watched = new Map<string, 'perpetual' | 'delivery' | 'option'>();
+  for (const position of paper.positions) watched.set(position.contract, position.product);
+  for (const order of paper.orders) {
+    if (order.status !== 'open') continue;
+    watched.set(order.contract, order.product);
+  }
+  return watched;
+}
+
+async function refreshWatchedContracts() {
+  if (watchRefreshPending) return;
+  watchRefreshPending = true;
+  try {
+    const selectedContract = gate.getMarket()?.contract;
+    const watched = collectWatchedContracts();
+    let refreshedAny = false;
+    for (const [contract, product] of watched.entries()) {
+      if (contract === selectedContract) continue;
+      try {
+        const market = await gate.refreshForOrder(contract, product);
+        if (!market) continue;
+        markToMarket(paper, market);
+        scheduleFunding(market);
+        refreshedAny = true;
+      } catch (error) {
+        api.log.warn({ err: error, contract, product }, 'Background refresh for watched contract failed.');
+      }
+    }
+    if (refreshedAny) persistAndPublish();
+  } finally {
+    watchRefreshPending = false;
+  }
+}
+
+function startWatchedContractsRefresh() {
+  if (watchedContractsTimer) clearInterval(watchedContractsTimer);
+  watchedContractsTimer = setInterval(() => void refreshWatchedContracts(), 2_000);
 }
 
 gate.setUpdateHandler((market, trade) => {
@@ -104,9 +147,12 @@ api.get('/api/paper/state', async () => ({
 }));
 
 api.post<{ Body: PlaceOrderInput }>('/api/paper/orders', async (request, reply) => {
-  const market = gate.getMarket(request.body.contract);
-  if (!market || !marketIsFresh(market)) return reply.code(409).send({ error: 'Live Gate market data is stale or unavailable; order rejected.' });
   try {
+    let market = gate.getMarket(request.body.contract);
+    if (!market || !marketIsFresh(market)) {
+      market = await gate.refreshForOrder(request.body.contract, request.body.product ?? 'perpetual');
+    }
+    if (!market || !marketIsFresh(market)) return reply.code(409).send({ error: 'Live Gate market data is stale or unavailable; order rejected.' });
     const order = placeOrder(paper, request.body, market, gate.getMarkets());
     persistAndPublish();
     if (order.status === 'rejected') return reply.code(409).send({ error: order.note });
@@ -126,7 +172,7 @@ api.delete<{ Params: { id: string } }>('/api/paper/orders/:id', async (request, 
   }
 });
 
-api.patch<{ Body: { leverage?: number; warningMarginRatio?: number; makerFeeRate?: string; takerFeeRate?: string; slippageBps?: string } }>('/api/paper/settings', async (request, reply) => {
+api.patch<{ Body: { leverage?: number; warningMarginRatio?: number; makerFeeRate?: string; takerFeeRate?: string; slippageBps?: string; marketRemainderMode?: 'cancel' | 'slippage-protected-rest' | 'aggressive-chase' } }>('/api/paper/settings', async (request, reply) => {
   try {
     updateSettings(paper, request.body);
     persistAndPublish();
@@ -157,6 +203,7 @@ api.get('/api/ws', { websocket: true }, (socket) => {
 
 try {
   await gate.start();
+  startWatchedContractsRefresh();
 } catch (error) {
   api.log.error({ err: error }, 'Gate initial market snapshot failed; API will remain available and retry via market selection.');
 }
@@ -164,6 +211,8 @@ try {
 await api.listen({ port, host: '127.0.0.1' });
 
 const shutdown = async () => {
+  if (watchedContractsTimer) clearInterval(watchedContractsTimer);
+  watchedContractsTimer = null;
   gate.stop();
   store.close();
   await api.close();

@@ -318,6 +318,7 @@ export class GateMarketService {
       this.closeSocket();
       return this.getMarket(contract);
     }
+
     this.stopOptionPolling();
     await this.refreshFuture(contract, product);
     if (product === 'delivery') {
@@ -329,6 +330,17 @@ export class GateMarketService {
       this.startRiskPolling(contract);
     }
     return this.getMarket(contract);
+  }
+
+  async refreshForOrder(contract: string, product: ProductKind = 'perpetual') {
+    if (product === 'option') {
+      await this.refreshOption(contract);
+      const market = this.markets[contract];
+      if (market) market.connected = true;
+      return market ?? null;
+    }
+    await this.refreshFuture(contract, product, true);
+    return this.markets[contract] ?? null;
   }
 
   async start() {
@@ -349,7 +361,7 @@ export class GateMarketService {
     this.closeSocket();
   }
 
-  private async refreshFuture(contract: string, product: 'perpetual' | 'delivery') {
+  private async refreshFuture(contract: string, product: 'perpetual' | 'delivery', forOrder = false) {
     const group = product === 'delivery' ? 'delivery' : 'futures';
     const [metadata, book, trades] = await Promise.all([
       getJson<GateContract>(`/${group}/usdt/contracts/${encodeURIComponent(contract)}`),
@@ -359,15 +371,13 @@ export class GateMarketService {
         : Promise.resolve([] as GateMarketTrade[]),
     ]);
     const market = marketFromContract(metadata, book, product);
-    if (product === 'perpetual') {
-      try {
-        market.riskTiers = await this.loadRiskTiers(contract, metadata);
-        market.riskUpdatedAt = Date.now();
-      } catch (error) {
-        market.riskDataError = error instanceof Error ? error.message : 'Gate risk tiers are unavailable.';
-      }
+    const existing = this.markets[contract];
+    if (product === 'perpetual' && existing) {
+      market.riskTiers = existing.riskTiers;
+      market.riskUpdatedAt = existing.riskUpdatedAt;
+      market.riskDataError = existing.riskDataError;
     }
-    this.orderBookId = Number(book.id ?? metadata.orderbook_id ?? 0);
+    if (contract === this.selected) this.orderBookId = Number(book.id ?? metadata.orderbook_id ?? 0);
     let newTrades: GateMarketTrade[] = [];
     if (product === 'delivery') {
       const seen = this.seenDeliveryTrades.get(contract);
@@ -380,8 +390,12 @@ export class GateMarketService {
       }
       market.trades = trades.slice(0, 40).map((trade) => normalizeFuturesTrade(contract, trade, market.last));
     }
+    if (forOrder && product === 'perpetual') market.connected = true;
     this.markets[contract] = market;
-    this.onUpdate(market);
+    if (!forOrder) this.onUpdate(market);
+    if (product === 'perpetual') {
+      void this.refreshRiskTiers(contract, metadata);
+    }
     for (const trade of newTrades) {
       const normalized = normalizeFuturesTrade(contract, trade, market.last);
       market.trades.unshift(normalized);
@@ -428,6 +442,7 @@ export class GateMarketService {
 
   private startRiskPolling(contract: string) {
     this.stopRiskPolling();
+    void this.refreshRiskTiers(contract);
     this.riskTimer = setInterval(() => void this.refreshRiskTiers(contract), 60_000);
   }
 
@@ -436,11 +451,13 @@ export class GateMarketService {
     this.riskTimer = null;
   }
 
-  private async refreshRiskTiers(contract: string) {
+  private async refreshRiskTiers(contract: string, metadata?: GateContract) {
     const market = this.markets[contract];
     if (!market || market.product !== 'perpetual') return;
     try {
-      const tiers = parseRiskTiers(await getJson<unknown>(`/futures/usdt/risk_limit_tiers?contract=${encodeURIComponent(contract)}`));
+      const tiers = metadata
+        ? await this.loadRiskTiers(contract, metadata)
+        : parseRiskTiers(await getJson<unknown>(`/futures/usdt/risk_limit_tiers?contract=${encodeURIComponent(contract)}`));
       if (tiers.length === 0) throw new Error('Gate returned invalid or unsupported risk tier metadata.');
       market.riskTiers = tiers;
       market.riskUpdatedAt = Date.now();

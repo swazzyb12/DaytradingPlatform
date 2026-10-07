@@ -253,6 +253,17 @@ export class GateMarketService {
         }
         return this.getMarket(contract);
     }
+    async refreshForOrder(contract, product = 'perpetual') {
+        if (product === 'option') {
+            await this.refreshOption(contract);
+            const market = this.markets[contract];
+            if (market)
+                market.connected = true;
+            return market ?? null;
+        }
+        await this.refreshFuture(contract, product, true);
+        return this.markets[contract] ?? null;
+    }
     async start() {
         const contracts = await this.listFutures('perpetual');
         const initial = contracts.find((item) => item.contract === 'BTC_USDT') ?? contracts[0];
@@ -271,7 +282,7 @@ export class GateMarketService {
             clearTimeout(this.reconnectTimer);
         this.closeSocket();
     }
-    async refreshFuture(contract, product) {
+    async refreshFuture(contract, product, forOrder = false) {
         const group = product === 'delivery' ? 'delivery' : 'futures';
         const [metadata, book, trades] = await Promise.all([
             getJson(`/${group}/usdt/contracts/${encodeURIComponent(contract)}`),
@@ -281,16 +292,14 @@ export class GateMarketService {
                 : Promise.resolve([]),
         ]);
         const market = marketFromContract(metadata, book, product);
-        if (product === 'perpetual') {
-            try {
-                market.riskTiers = await this.loadRiskTiers(contract, metadata);
-                market.riskUpdatedAt = Date.now();
-            }
-            catch (error) {
-                market.riskDataError = error instanceof Error ? error.message : 'Gate risk tiers are unavailable.';
-            }
+        const existing = this.markets[contract];
+        if (product === 'perpetual' && existing) {
+            market.riskTiers = existing.riskTiers;
+            market.riskUpdatedAt = existing.riskUpdatedAt;
+            market.riskDataError = existing.riskDataError;
         }
-        this.orderBookId = Number(book.id ?? metadata.orderbook_id ?? 0);
+        if (contract === this.selected)
+            this.orderBookId = Number(book.id ?? metadata.orderbook_id ?? 0);
         let newTrades = [];
         if (product === 'delivery') {
             const seen = this.seenDeliveryTrades.get(contract);
@@ -306,8 +315,14 @@ export class GateMarketService {
             }
             market.trades = trades.slice(0, 40).map((trade) => normalizeFuturesTrade(contract, trade, market.last));
         }
+        if (forOrder && product === 'perpetual')
+            market.connected = true;
         this.markets[contract] = market;
-        this.onUpdate(market);
+        if (!forOrder)
+            this.onUpdate(market);
+        if (product === 'perpetual') {
+            void this.refreshRiskTiers(contract, metadata);
+        }
         for (const trade of newTrades) {
             const normalized = normalizeFuturesTrade(contract, trade, market.last);
             market.trades.unshift(normalized);
@@ -356,6 +371,7 @@ export class GateMarketService {
     }
     startRiskPolling(contract) {
         this.stopRiskPolling();
+        void this.refreshRiskTiers(contract);
         this.riskTimer = setInterval(() => void this.refreshRiskTiers(contract), 60_000);
     }
     stopRiskPolling() {
@@ -363,12 +379,14 @@ export class GateMarketService {
             clearInterval(this.riskTimer);
         this.riskTimer = null;
     }
-    async refreshRiskTiers(contract) {
+    async refreshRiskTiers(contract, metadata) {
         const market = this.markets[contract];
         if (!market || market.product !== 'perpetual')
             return;
         try {
-            const tiers = parseRiskTiers(await getJson(`/futures/usdt/risk_limit_tiers?contract=${encodeURIComponent(contract)}`));
+            const tiers = metadata
+                ? await this.loadRiskTiers(contract, metadata)
+                : parseRiskTiers(await getJson(`/futures/usdt/risk_limit_tiers?contract=${encodeURIComponent(contract)}`));
             if (tiers.length === 0)
                 throw new Error('Gate returned invalid or unsupported risk tier metadata.');
             market.riskTiers = tiers;

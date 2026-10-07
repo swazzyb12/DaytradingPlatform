@@ -7,6 +7,7 @@ export type TriggerReference = 'mark' | 'last' | 'index';
 export type OrderStatus = 'open' | 'triggered' | 'filled' | 'cancelled' | 'rejected';
 export type ProductKind = 'perpetual' | 'delivery' | 'option';
 export type PositionMode = 'one-way' | 'hedge';
+export type MarketRemainderMode = 'cancel' | 'slippage-protected-rest' | 'aggressive-chase';
 
 export interface BookLevel {
   price: string;
@@ -91,6 +92,7 @@ export interface PaperOrder {
   expiresAt?: number | null;
   parentOrderId?: string | null;
   childOrderId?: string | null;
+  remainderMode?: MarketRemainderMode;
 }
 
 export interface PaperPosition {
@@ -158,6 +160,7 @@ export interface PaperState {
   makerFeeRate: string;
   takerFeeRate: string;
   slippageBps: string;
+  marketRemainderMode: MarketRemainderMode;
   orders: PaperOrder[];
   positions: PaperPosition[];
   fills: PaperFill[];
@@ -214,6 +217,7 @@ export function createInitialState(initialBalance = '10000'): PaperState {
     makerFeeRate: '0.0002',
     takerFeeRate: '0.0005',
     slippageBps: '2',
+    marketRemainderMode: 'cancel',
     orders: [],
     positions: [],
     fills: [],
@@ -236,6 +240,8 @@ function addLedger(state: PaperState, type: LedgerEntry['type'], amount: Decimal
 }
 
 export function accountMetrics(state: PaperState, markets: Record<string, MarketSnapshot>) {
+  const now = Date.now();
+  const dayAgo = now - 24 * 60 * 60 * 1000;
   const unrealized = state.positions.reduce((total, position) => {
     const market = markets[position.contract];
     if (!market) return total;
@@ -263,9 +269,19 @@ export function accountMetrics(state: PaperState, markets: Record<string, Market
     return total.plus(notional.times(initialRate.plus(market.exitFeeRate ?? '0')));
   }, ZERO);
   const equity = D(state.balance).plus(unrealized);
+  const realizedAllTime = D(state.balance).minus(state.initialBalance);
+  const pnlAllTime = equity.minus(state.initialBalance);
+  const pnl24hRealized = state.ledger.reduce((total, entry) => {
+    if (entry.type === 'initial_balance' || entry.createdAt < dayAgo) return total;
+    return total.plus(entry.amount);
+  }, ZERO);
   return {
     balance: state.balance,
+    realizedPnl: realizedAllTime.toFixed(2),
+    allTimePnl: pnlAllTime.toFixed(2),
     unrealizedPnl: unrealized.toFixed(2),
+    pnl24hRealized: pnl24hRealized.toFixed(2),
+    pnl24hUnrealized: unrealized.toFixed(2),
     equity: equity.toFixed(2),
     usedMargin: usedMargin.toFixed(2),
     pendingMargin: pendingMargin.toFixed(2),
@@ -505,6 +521,47 @@ function applyFill(state: PaperState, order: PaperOrder, market: MarketSnapshot,
   if (market.product === 'option') addLedger(state, 'option_premium', size.times(price).times(multiplier).times(-sign), 'Options premium cashflow', market.contract);
 }
 
+function slippageProtectedLimitPrice(state: PaperState, order: PaperOrder, market: MarketSnapshot, referencePrice: Decimal) {
+  const fallback = D(market.mark).gt(0) ? D(market.mark) : D(market.last);
+  const anchor = referencePrice.isFinite() && referencePrice.gt(0) ? referencePrice : fallback;
+  const slip = D(state.slippageBps).div(10000);
+  const raw = order.side === 'buy'
+    ? anchor.times(D(1).plus(slip))
+    : anchor.times(D(1).minus(slip));
+  const step = D(market.priceStep);
+  if (!step.isFinite() || !step.gt(0)) return raw.gt(0) ? raw : anchor;
+  const stepped = order.side === 'buy'
+    ? raw.div(step).floor().times(step)
+    : raw.div(step).ceil().times(step);
+  return stepped.gt(0) ? stepped : step;
+}
+
+function continueUnfilledMarketOrder(state: PaperState, order: PaperOrder, market: MarketSnapshot, referencePrice: Decimal, mode: MarketRemainderMode) {
+  if (mode === 'cancel') {
+    const originalQuantity = D(order.quantity);
+    order.status = D(order.remaining).eq(originalQuantity) ? 'rejected' : 'cancelled';
+    order.note = 'Visible order-book depth was insufficient; unfilled quantity was cancelled.';
+    return;
+  }
+  const protectedLimit = slippageProtectedLimitPrice(state, order, market, referencePrice);
+  order.kind = 'limit';
+  order.limitPrice = protectedLimit.toFixed();
+  order.status = 'open';
+  order.remainderMode = mode;
+  if (mode === 'aggressive-chase') {
+    order.note = `Visible order-book depth was insufficient; ${order.remaining} contracts remain open and will reprice as a slippage-protected chasing limit order.`;
+    return;
+  }
+  order.note = `Visible order-book depth was insufficient; ${order.remaining} contracts remain resting as a slippage-protected limit order at ${order.limitPrice}.`;
+}
+
+function refreshAggressiveRemainderOrder(state: PaperState, order: PaperOrder, market: MarketSnapshot) {
+  if (order.kind !== 'limit' || order.status !== 'open' || order.remainderMode !== 'aggressive-chase' || !D(order.remaining).gt(0)) return;
+  const reference = order.side === 'buy' ? D(market.asks[0]?.price ?? market.mark) : D(market.bids[0]?.price ?? market.mark);
+  order.limitPrice = slippageProtectedLimitPrice(state, order, market, reference).toFixed();
+  order.note = `Visible order-book depth was insufficient; ${order.remaining} contracts remain open and will reprice as a slippage-protected chasing limit order.`;
+}
+
 function simulateLiquidation(state: PaperState, market: MarketSnapshot) {
   if (market.product !== 'perpetual' || market.contractType !== 'direct') return;
   const position = state.positions.find((item) => item.contract === market.contract);
@@ -618,17 +675,19 @@ export function placeOrder(
   if (input.kind === 'trigger-market' || input.kind === 'trigger-limit') return order;
   if (input.kind === 'market') {
     const levels = input.side === 'buy' ? market.asks : market.bids;
+    let continuationReference = D(levels[0]?.price ?? market.mark);
     let remaining = quantity;
     for (const level of levels) {
       if (!remaining.gt(0)) break;
       const available = D(level.size);
       const fillSize = Decimal.min(remaining, available);
-      applyFill(state, order, market, fillSize, D(level.price), 'taker');
+      const levelPrice = D(level.price);
+      continuationReference = levelPrice;
+      applyFill(state, order, market, fillSize, levelPrice, 'taker');
       remaining = D(order.remaining);
     }
     if (D(order.remaining).gt(0)) {
-      order.status = D(order.remaining).eq(quantity) ? 'rejected' : 'cancelled';
-      order.note = 'Visible order-book depth was insufficient; unfilled quantity was cancelled.';
+      continueUnfilledMarketOrder(state, order, market, continuationReference, state.marketRemainderMode);
     }
   } else {
     const limit = D(input.limitPrice!);
@@ -718,6 +777,7 @@ function processTriggers(state: PaperState, market: MarketSnapshot) {
     state.orders = state.orders.slice(0, MAX_ROWS);
     const executableOrder = childOrder;
     const levels = order.side === 'buy' ? market.asks : market.bids;
+    let continuationReference = D(levels[0]?.price ?? market.mark);
     let remaining = D(order.remaining);
     for (const level of levels) {
       if (!remaining.gt(0)) break;
@@ -725,12 +785,17 @@ function processTriggers(state: PaperState, market: MarketSnapshot) {
       const marketable = executableOrder.kind === 'market' || (executableOrder.side === 'buy' ? levelPrice.lte(executableOrder.limitPrice!) : levelPrice.gte(executableOrder.limitPrice!));
       if (!marketable) break;
       const size = Decimal.min(remaining, D(level.size));
+      continuationReference = levelPrice;
       applyFill(state, executableOrder, market, size, levelPrice, 'taker');
       remaining = D(executableOrder.remaining);
     }
     if (remaining.gt(0)) {
-      executableOrder.status = remaining.eq(D(executableOrder.quantity)) ? 'rejected' : 'cancelled';
-      executableOrder.note += ' Visible depth was insufficient; unfilled quantity was cancelled.';
+      if (executableOrder.kind === 'market') {
+        continueUnfilledMarketOrder(state, executableOrder, market, continuationReference, state.marketRemainderMode);
+      } else {
+        executableOrder.status = 'open';
+        executableOrder.note += ' Trigger activated; unfilled quantity is resting at the limit price.';
+      }
     }
   }
 }
@@ -781,6 +846,10 @@ export function markToMarket(
     position.markPrice = market.mark;
     position.updatedAt = Date.now();
   }
+  for (const order of state.orders) {
+    if (order.contract !== market.contract) continue;
+    refreshAggressiveRemainderOrder(state, order, market);
+  }
   processTriggers(state, market);
   if (fundingEvent && market.product === 'perpetual' && Date.now() >= fundingEvent.at && (state.lastFundingAt[market.contract] ?? 0) < fundingEvent.at) {
     state.lastFundingAt[market.contract] = fundingEvent.at;
@@ -795,7 +864,14 @@ export function markToMarket(
   simulateLiquidation(state, market);
 }
 
-export function updateSettings(state: PaperState, input: { leverage?: number; warningMarginRatio?: number; makerFeeRate?: string; takerFeeRate?: string; slippageBps?: string }) {
+export function updateSettings(state: PaperState, input: {
+  leverage?: number;
+  warningMarginRatio?: number;
+  makerFeeRate?: string;
+  takerFeeRate?: string;
+  slippageBps?: string;
+  marketRemainderMode?: MarketRemainderMode;
+}) {
   if (input.leverage !== undefined) {
     if (!Number.isInteger(input.leverage) || input.leverage < 1 || input.leverage > 100) throw new Error('Leverage must be a whole number between 1 and 100.');
     state.leverage = input.leverage;
@@ -814,6 +890,10 @@ export function updateSettings(state: PaperState, input: { leverage?: number; wa
       throw new Error(`Invalid ${key}.`);
     }
     state[key] = amount.toFixed();
+  }
+  if (input.marketRemainderMode !== undefined) {
+    if (!['cancel', 'slippage-protected-rest', 'aggressive-chase'].includes(input.marketRemainderMode)) throw new Error('Invalid marketRemainderMode.');
+    state.marketRemainderMode = input.marketRemainderMode;
   }
 }
 
